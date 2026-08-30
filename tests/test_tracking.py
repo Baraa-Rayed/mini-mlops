@@ -86,3 +86,22 @@ def test_one_dag_run_is_recoverable_from_its_tag(store_home):
         filter_string="tags.`mini.run_id` = 'iris__test__abc123'",
     )
     assert sorted(found["tags.mini.task_id"]) == ["prep", "select_best", "train_logreg"]
+
+
+def test_prediction_trace_records_inference(store_home):
+    """Training is recorded as runs, inference as traces. Without this, a
+    served model answers requests that leave no mark anywhere — which is how
+    drift goes unnoticed."""
+    from mlflow.tracking import MlflowClient
+
+    from mini.tracking import prediction_trace
+
+    with prediction_trace("iris", "models:/iris-classifier/1") as span:
+        span.set_inputs({"rows": [[5.1, 3.5, 1.4, 0.2]]})
+        span.set_outputs({"predictions": [0], "labels": ["setosa"]})
+
+    mlflow.flush_trace_async_logging()
+    experiment = mlflow.get_experiment_by_name("iris")
+    traces = MlflowClient().search_traces(locations=[experiment.experiment_id])
+    assert len(traces) == 1
+    assert "setosa" in str(traces[0].data.spans[0].outputs)

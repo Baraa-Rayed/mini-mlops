@@ -430,6 +430,24 @@ def cmd_predict(args) -> int:
     predictions = model.predict(frame)
 
     probabilities = model.predict_proba(frame) if hasattr(model, "predict_proba") else None
+
+    if not args.no_trace:
+        # Record the call so it shows up in the dashboard's Traces tab. Without
+        # this, inference is invisible: the tracking store knows how the model
+        # was built and nothing about how it is used.
+        from .tracking import prediction_trace
+
+        experiment = tags.get("mini.dag_id") or "inference"
+        try:
+            with prediction_trace(experiment, f"models:/{name}/{version.version}") as span:
+                span.set_inputs({"rows": rows, "features": features})
+                span.set_outputs({
+                    "predictions": [int(p) for p in predictions],
+                    "labels": [classes[int(p)] for p in predictions],
+                })
+        except Exception as exc:  # noqa: BLE001 — never fail a prediction over telemetry
+            print(f"(trace not recorded: {exc})", file=sys.stderr)
+
     for i, (row, prediction) in enumerate(zip(rows, predictions)):
         label = classes[int(prediction)]
         line = f"{row} -> {label}"
@@ -560,6 +578,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("values", nargs="*", help='one row per argument, e.g. "5.1,3.5,1.4,0.2"')
     p.add_argument("--model", default=None, help="registered model name")
     p.add_argument("--show", action="store_true", help="describe the registered model and exit")
+    p.add_argument("--no-trace", action="store_true",
+                   help="do not record this call in the MLflow Traces tab")
     p.set_defaults(func=cmd_predict)
 
     g = sub.add_parser("gitops", help="reconcile pipelines from a git repo")

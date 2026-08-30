@@ -87,6 +87,27 @@ def task_run(ctx, experiment: str | None = None):
         yield mlflow, run
 
 
+@contextmanager
+def prediction_trace(experiment: str, model_uri: str):
+    """Record one inference call as an MLflow *trace*.
+
+    Training is recorded as runs; inference is not, and by default a served
+    model answers thousands of requests that leave no mark anywhere. That gap
+    is how a model degrades unnoticed: without a record of what was asked, you
+    cannot tell that live traffic has drifted away from the training
+    distribution.
+
+    Traces are the right shape for this rather than runs — a run represents a
+    piece of work with parameters and results, and one prediction is neither.
+    They land in the Traces tab of the same experiment as the training runs,
+    so the model and its usage sit in one place.
+    """
+    mlflow = connect(experiment)
+    with mlflow.start_span(name="predict") as span:
+        span.set_attribute("model_uri", model_uri)
+        yield span
+
+
 def promote(model_uri: str, name: str = DEFAULT_MODEL_NAME, tags: dict | None = None):
     """Register a logged model as a new version of `name`.
 
