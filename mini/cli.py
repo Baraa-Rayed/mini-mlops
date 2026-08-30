@@ -200,9 +200,32 @@ def cmd_ui(args) -> int:
     which is empty and looks like nothing ever ran. Pointing it at the same
     backend the pipelines write to is the whole value of this command.
     """
+    import socket
     import subprocess
 
     from .tracking import artifact_root, tracking_uri
+
+    # MLflow rejects any Host header it does not recognise, returning
+    # "Invalid Host header - possible DNS rebinding attack detected". Its
+    # defaults cover loopback and private IP ranges but *not hostnames*, so
+    # binding to 0.0.0.0 and then browsing to http://<machine-name>:5000 —
+    # the obvious thing to do — gets a 403 while the IP works fine.
+    #
+    # Note /health and /version are exempt from the check, so a health probe
+    # succeeds against a server the browser cannot use. Do not health-check
+    # your way to "it works".
+    env = os.environ.copy()
+    extra = list(args.allow_host or [])
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        extra += [socket.gethostname(), socket.getfqdn()]
+    if extra and not env.get("MLFLOW_SERVER_ALLOWED_HOSTS"):
+        # The env var *replaces* MLflow's defaults rather than adding to them,
+        # so they have to be restated or loopback access breaks.
+        defaults = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0",
+                    "localhost:*", "127.0.0.1:*", "[[]::1]:*", "0.0.0.0:*",
+                    "192.168.*", "10.*", *[f"172.{n}.*" for n in range(16, 32)]]
+        names = [f"{h}:*" for h in extra] + extra + defaults
+        env["MLFLOW_SERVER_ALLOWED_HOSTS"] = ",".join(dict.fromkeys(names))
 
     # `sys.executable -m mlflow`, not the bare `mlflow` console script: the
     # script only exists on PATH if this environment's bin directory happens
@@ -216,9 +239,15 @@ def cmd_ui(args) -> int:
            "--host", args.host, "--port", str(args.port)]
     print(f"tracking  {tracking_uri()}")
     print(f"artifacts {artifact_root()}")
-    print(f"opening   http://{args.host}:{args.port}  — ctrl-c to stop\n")
+    if args.host == "0.0.0.0":
+        addresses = sorted({socket.gethostbyname(socket.gethostname()), "127.0.0.1"})
+        print(f"reachable {', '.join(f'http://{a}:{args.port}' for a in addresses)}")
+        print(f"          http://{socket.gethostname()}:{args.port}  (hostname allowed)")
+    else:
+        print(f"opening   http://{args.host}:{args.port}")
+    print("          ctrl-c to stop\n")
     try:
-        return subprocess.call(cmd)
+        return subprocess.call(cmd, env=env)
     except KeyboardInterrupt:
         return 0
 
@@ -390,8 +419,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_reap)
 
     p = sub.add_parser("ui", help="open the MLflow dashboard on this project's store")
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to expose on the network")
     p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--allow-host", action="append",
+                   help="extra Host header to accept, e.g. a DNS name or reverse-proxy "
+                        "domain (repeatable); MLflow 403s anything it does not recognise")
     p.set_defaults(func=cmd_ui)
 
     p = sub.add_parser("predict", help="score a row with the registered model")
