@@ -142,3 +142,32 @@ def test_root_redirects_to_the_docs(client):
 
 def test_favicon_is_answered_quietly(client):
     assert client.get("/favicon.ico").status_code == 204
+
+
+def test_swagger_placeholder_strings_do_not_500(client):
+    """Swagger's "Try it out" fills every optional string with the literal
+    "string", so this is the body a first-time user actually sends. It used to
+    reach MLflow as a version named "string" and escape as a 500."""
+    response = client.post("/predict", json={
+        "rows": [[5.1, 3.5, 1.4, 0.2]],
+        "model_name": "string",
+        "version": "string",
+        "trace": False,
+    })
+    assert response.status_code != 500, response.text
+    assert response.status_code in (200, 404)
+
+
+def test_a_missing_version_is_404_not_500(client):
+    response = client.post("/predict", json={"rows": [[5.1, 3.5, 1.4, 0.2]], "version": "9999"})
+    assert response.status_code in (404, 503)
+    assert "detail" in response.json()
+
+
+def test_the_documented_example_is_the_one_that_works(client):
+    """The example rendered in /docs must be a body that succeeds — otherwise
+    the first thing anyone clicks returns an error."""
+    schema = client.get("/openapi.json").json()
+    example = schema["components"]["schemas"]["PredictRequest"]["example"]
+    assert set(example) == {"rows"}
+    assert client.post("/predict", json=example).status_code in (200, 404)

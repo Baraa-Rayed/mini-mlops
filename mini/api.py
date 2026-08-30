@@ -76,13 +76,19 @@ class TriggerRequest(BaseModel):
 
 
 class PredictRequest(BaseModel):
-    rows: list[list[float]] = Field(
-        description="one row of feature values per prediction",
-        json_schema_extra={"example": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]},
-    )
-    model_name: str | None = None
-    version: str | None = None
+    rows: list[list[float]] = Field(description="one row of feature values per prediction")
+    model_name: str | None = Field(default=None, description="registered model name (default: the project's)")
+    version: str | None = Field(default=None, description="model version (default: newest)")
     trace: bool = Field(default=True, description="record the call in MLflow's Traces tab")
+
+    # Swagger pre-fills every optional string with the literal "string", so the
+    # body it hands a first-time user would ask for version "string" and fail.
+    # Pinning the example to just `rows` makes the default Execute succeed.
+    model_config = {
+        "json_schema_extra": {
+            "example": {"rows": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]}
+        }
+    }
 
 
 class PredictionOut(BaseModel):
@@ -260,6 +266,8 @@ def create_app(home: Path | str | None = None, dags_dir: Path | str = DEFAULT_DA
             registered = load(name, version)
         except NoModelRegistered as exc:
             raise HTTPException(404, str(exc)) from None
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, f"model registry unavailable: {exc}") from None
         return ModelInfo(name=registered.name, version=registered.version, uri=registered.uri,
                          kind=registered.kind, accuracy=registered.accuracy,
                          features=registered.features, classes=registered.classes,
@@ -284,6 +292,8 @@ def create_app(home: Path | str | None = None, dags_dir: Path | str = DEFAULT_DA
             registered = load(request.model_name, request.version)
         except NoModelRegistered as exc:
             raise HTTPException(404, str(exc)) from None
+        except Exception as exc:  # noqa: BLE001 — a registry fault is not a caller fault
+            raise HTTPException(503, f"model registry unavailable: {exc}") from None
         try:
             results = predict(registered, request.rows, trace=request.trace)
         except ValueError as exc:

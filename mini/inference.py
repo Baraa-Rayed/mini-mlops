@@ -36,6 +36,24 @@ class RegisteredModel:
 
 _CACHE: dict[tuple[str, str | None], RegisteredModel] = {}
 
+# Swagger's "Try it out" pre-fills every optional string field with the
+# literal "string". Treating that as "unset" is the difference between a
+# newcomer's first click working and it returning an error about a model
+# version named "string".
+_PLACEHOLDERS = {"", "string", "null", "none"}
+
+
+def _normalise_name(name: str | None) -> str | None:
+    if name is None or str(name).strip().lower() in _PLACEHOLDERS:
+        return None
+    return str(name).strip()
+
+
+def _normalise_version(version: str | None) -> str | None:
+    if version is None or str(version).strip().lower() in _PLACEHOLDERS:
+        return None
+    return str(version).strip()
+
 
 def load(name: str | None = None, version: str | None = None, cache: bool = True) -> RegisteredModel:
     """Resolve and load the registered model.
@@ -44,7 +62,8 @@ def load(name: str | None = None, version: str | None = None, cache: bool = True
     reloaded per request would spend milliseconds on arithmetic and seconds on
     disk. Pass `cache=False` after promoting a new version.
     """
-    name = name or DEFAULT_MODEL_NAME
+    name = _normalise_name(name) or DEFAULT_MODEL_NAME
+    version = _normalise_version(version)
     key = (name, version)
     if cache and key in _CACHE:
         return _CACHE[key]
@@ -62,7 +81,13 @@ def load(name: str | None = None, version: str | None = None, cache: bool = True
     else:
         from mlflow.tracking import MlflowClient
 
-        found = MlflowClient().get_model_version(name, version)
+        try:
+            found = MlflowClient().get_model_version(name, version)
+        except Exception as exc:  # noqa: BLE001 — MlflowException and friends
+            # Asking for a version that does not exist is a caller mistake, not
+            # a server fault. Without this it escapes as a 500 with a stack
+            # trace, which tells the caller nothing they can act on.
+            raise NoModelRegistered(f"no version {version!r} of model {name!r}: {exc}") from None
         tags = dict(found.tags or {})
 
     uri = f"models:/{name}/{version}"
