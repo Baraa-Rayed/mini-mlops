@@ -11,6 +11,7 @@ decision here, it probably belongs in scheduler.py.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,16 @@ def paint(state: str) -> str:
     if not sys.stdout.isatty():
         return state
     return f"{_COLOURS.get(state, '')}{state}\033[0m"
+
+
+def pad(state: str, width: int) -> str:
+    """Colour a state, then pad it to a *visible* width.
+
+    `f"{paint(s):<10}"` counts the ANSI escape bytes as characters, so on a
+    terminal the padding is consumed by codes nobody can see and every
+    following column shifts left. Pad against the bare text instead.
+    """
+    return paint(state) + " " * max(0, width - len(state))
 
 
 def ago(ts: float | None) -> str:
@@ -100,7 +111,7 @@ def _report(store: Store, run_id: str) -> int:
     print(f"\nrun {run_id}  [{paint(run['state'])}]  in {took}")
     for task_id, row in sorted(store.task_states_full(run_id).items()):
         took = f"{row['finished_at'] - row['started_at']:.1f}s" if row["started_at"] and row["finished_at"] else "-"
-        line = f"  {task_id:<18} {paint(row['state']):<20} try={row['try_number']} {took:>7}"
+        line = f"  {task_id:<18} {pad(row['state'], 17)} try={row['try_number']} {took:>7}"
         print(line + (f"\n      {row['error']}" if row["error"] else ""))
     print(f"\nartifacts: {run['run_dir']}")
     return 0 if run["state"] == SUCCESS else 1
@@ -112,9 +123,9 @@ def cmd_runs(args) -> int:
     if not rows:
         print("no runs yet")
         return 0
-    print(f"{'RUN':<44} {'DAG':<18} {'STATE':<10} {'TRIGGER':<9} CREATED")
+    print(f"{'RUN':<44} {'DAG':<18} {'STATE':<16} {'TRIGGER':<9} CREATED")
     for row in rows:
-        print(f"{row['run_id']:<44} {row['dag_id']:<18} {paint(row['state']):<10} "
+        print(f"{row['run_id']:<44} {row['dag_id']:<18} {pad(row['state'], 16)} "
               f"{row['trigger']:<9} {ago(row['created_at'])}")
     return 0
 
@@ -139,6 +150,105 @@ def cmd_logs(args) -> int:
     for path in logs if args.all_tries else logs[-1:]:
         print(f"===== {path.name} =====")
         print(path.read_text())
+    return 0
+
+
+def cmd_reap(args) -> int:
+    """Mark runs abandoned by a dead scheduler.
+
+    `resume` adopts orphaned *tasks* inside a run, but nothing closed out the
+    run itself: kill a scheduler mid-flight and its row sits in `running`
+    forever, so `mini runs` shows work that no process is doing.
+
+    We have no heartbeat, so age is the proxy — a run older than the threshold
+    and still `running` is presumed dead. That is a real limitation, not a
+    detail: a genuinely long run gets reaped if you set the threshold too low,
+    which is why nothing calls this automatically.
+    """
+    from .state import RUNNING
+
+    store = Store(args.home)
+    now = time.time()
+    stale = [r for r in store.list_runs(limit=1000)
+             if r["state"] == RUNNING and now - r["created_at"] > args.older_than]
+    if not stale:
+        print(f"no runs stuck in 'running' for more than {args.older_than:g}s")
+        return 0
+
+    for run in stale:
+        tasks = store.task_states_full(run["run_id"])
+        orphans = [t for t, row in tasks.items() if row["state"] == RUNNING]
+        print(f"{'would reap' if args.dry_run else 'reaped'} {run['run_id']} "
+              f"({ago(run['created_at'])}, {len(orphans)} task(s) mid-flight)")
+        if args.dry_run:
+            continue
+        for task_id in orphans:
+            store.set_task_state(run["run_id"], task_id, FAILED, finished_at=now,
+                                 error="abandoned: the scheduler running this task died")
+        store.finish_run(run["run_id"], FAILED)
+
+    if not args.dry_run:
+        print(f"\n{len(stale)} run(s) closed out. `mini resume <run_id>` re-drives one from where it stopped.")
+    return 0
+
+
+def cmd_predict(args) -> int:
+    """Load whatever the pipeline last promoted, and score a row with it.
+
+    The counterpart to `register`: training is only half a pipeline, and a
+    model nobody can call is indistinguishable from one that was never built.
+    It reads `latest.json` rather than a path you supply, so what answers here
+    is by construction what the quality gate actually approved.
+    """
+    import json as jsonlib
+
+    registry = Path(os.environ.get("MINI_REGISTRY", "model_registry"))
+    latest = registry / "latest.json"
+    if not latest.exists():
+        print(f"no registered model at {latest} — run `mini run iris` first", file=sys.stderr)
+        return 1
+
+    entry = jsonlib.loads(latest.read_text())
+    model_path = Path(entry["model"])
+    if not model_path.exists():
+        print(f"registry points at a missing file: {model_path}", file=sys.stderr)
+        return 1
+
+    import joblib
+    import pandas as pd
+
+    features, classes = entry["features"], entry["classes"]
+    if args.show:
+        print(f"model     {entry['kind']}  ({entry['version']})")
+        print(f"accuracy  {entry['accuracy']:.4f}")
+        print(f"features  {', '.join(features)}")
+        print(f"classes   {', '.join(classes)}")
+        return 0
+
+    rows = []
+    for raw in args.values:
+        parts = [p for p in raw.replace(",", " ").split() if p]
+        if len(parts) != len(features):
+            print(f"expected {len(features)} values ({', '.join(features)}), got {len(parts)}: {raw!r}",
+                  file=sys.stderr)
+            return 1
+        rows.append([float(p) for p in parts])
+
+    model = joblib.load(model_path)
+    # A DataFrame with the training column names, not a bare array: sklearn
+    # matches features by position but warns when the names go missing, and
+    # a silent column-order mismatch is a wrong answer rather than an error.
+    frame = pd.DataFrame(rows, columns=features)
+    predictions = model.predict(frame)
+
+    probabilities = model.predict_proba(frame) if hasattr(model, "predict_proba") else None
+    for i, (row, prediction) in enumerate(zip(rows, predictions)):
+        label = classes[int(prediction)]
+        line = f"{row} -> {label}"
+        if probabilities is not None:
+            best = probabilities[i][int(prediction)]
+            line += f"  (confidence {best:.3f})"
+        print(line)
     return 0
 
 
@@ -234,6 +344,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id")
     p.add_argument("--all-tries", action="store_true", help="show every attempt, not just the last")
     p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("reap", help="close out runs abandoned by a dead scheduler")
+    p.add_argument("--older-than", type=float, default=900.0,
+                   help="only runs stuck in 'running' longer than this many seconds (default 900)")
+    p.add_argument("--dry-run", action="store_true", help="list what would be reaped, change nothing")
+    p.set_defaults(func=cmd_reap)
+
+    p = sub.add_parser("predict", help="score a row with the last registered model")
+    p.add_argument("values", nargs="*", help='one row per argument, e.g. "5.1,3.5,1.4,0.2"')
+    p.add_argument("--show", action="store_true", help="describe the registered model and exit")
+    p.set_defaults(func=cmd_predict)
 
     g = sub.add_parser("gitops", help="reconcile pipelines from a git repo")
     g.add_argument("--repo", required=True, help="git URL or local path")

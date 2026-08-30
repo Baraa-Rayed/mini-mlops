@@ -40,7 +40,15 @@ def prep(ctx: Context) -> dict:
     train_path, test_path = ctx.artifact("train.csv"), ctx.artifact("test.csv")
     train.to_csv(train_path, index=False)
     test.to_csv(test_path, index=False)
-    return {"train": str(train_path), "test": str(test_path), "rows": len(train), "features": len(data.feature_names)}
+    return {
+        "train": str(train_path),
+        "test": str(test_path),
+        "rows": len(train),
+        # Carried forward so inference never has to guess the column order or
+        # decode a bare class index. A model without its schema is a liability.
+        "feature_names": list(data.feature_names),
+        "class_names": list(data.target_names),
+    }
 
 
 def _fit(ctx: Context, model):
@@ -110,11 +118,24 @@ def register(ctx: Context) -> dict:
     version = ctx.run_id
     target = registry / f"{version}.joblib"
     shutil.copy2(best["model"], target)
-    (registry / "latest.json").write_text(
-        json.dumps({"version": version, "path": str(target), **best}, indent=2)
-    )
+
+    # Spelled out field by field rather than `**best`. Spreading the upstream
+    # dict also copied its `model` key — a path inside the run directory,
+    # which is disposable — leaving two similarly-named paths in the file and
+    # no way to tell which one survives. The run artifact is kept, but under
+    # `source_run`, where it reads as provenance rather than something to load.
+    prep = ctx.upstream["prep"]
+    (registry / "latest.json").write_text(json.dumps({
+        "version": version,
+        "model": str(target),
+        "kind": best["kind"],
+        "accuracy": best["accuracy"],
+        "features": prep["feature_names"],
+        "classes": prep["class_names"],
+        "source_run": {"run_id": ctx.run_id, "task": best["task"], "artifact": best["model"]},
+    }, indent=2))
     print(f"registered {best['kind']} as {version}")
-    return {"version": version, "path": str(target), "accuracy": best["accuracy"]}
+    return {"version": version, "model": str(target), "accuracy": best["accuracy"]}
 
 
 with DAG("iris", schedule="@hourly", description="train + gate an iris classifier") as dag:
