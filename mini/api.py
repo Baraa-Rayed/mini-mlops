@@ -200,8 +200,27 @@ def create_app(home: Path | str | None = None, dags_dir: Path | str = DEFAULT_DA
             order=dag.topological_order(),
         )
 
+    TRIGGER_EXAMPLES = {
+        "start and poll": {
+            "summary": "Return a run_id immediately (the default)",
+            "description": (
+                "Use this for anything real. `iris` takes about twenty seconds, "
+                "far longer than an HTTP request should hold a connection open — "
+                "poll `GET /runs/{run_id}` for the outcome."
+            ),
+            "value": {"wait": False},
+        },
+        "block until finished": {
+            "summary": "Hold the request open and return the finished run",
+            "description": "Convenient for a fast DAG such as `flaky`; a bad idea for a slow one.",
+            "value": {"wait": True},
+        },
+    }
+
     @app.post("/dags/{dag_id}/runs", response_model=RunDetail, status_code=202, tags=["pipelines"])
-    def trigger_dag(dag_id: str, request: TriggerRequest = Body(default=TriggerRequest())):
+    def trigger_dag(dag_id: str,
+                    request: TriggerRequest = Body(default=TriggerRequest(),
+                                                   openapi_examples=TRIGGER_EXAMPLES)):
         """Start a run. Returns immediately with the run_id unless `wait` is set.
 
         A pipeline takes tens of seconds, which is far longer than an HTTP
@@ -280,13 +299,54 @@ def create_app(home: Path | str | None = None, dags_dir: Path | str = DEFAULT_DA
         clear_cache()
         return {"status": "cache cleared"}
 
+    # Several named examples rather than one, so `version` and `trace` are
+    # discoverable without the default body carrying them. Swagger renders
+    # these as a dropdown; every one of them is a body that succeeds, which is
+    # the property the tests enforce.
+    PREDICT_EXAMPLES = {
+        "one of each species": {
+            "summary": "Newest registered model — returns setosa, versicolor, virginica",
+            "value": {"rows": [[5.1, 3.5, 1.4, 0.2],
+                               [5.9, 3.0, 4.2, 1.5],
+                               [6.7, 3.0, 5.2, 2.3]]},
+        },
+        "pin a registry version": {
+            "summary": "Score against a specific version instead of the newest",
+            "description": (
+                "Use this to compare a challenger against the model currently "
+                "serving. Omit `version` and you always get the newest."
+            ),
+            "value": {"rows": [[5.1, 3.5, 1.4, 0.2]], "version": "1"},
+        },
+        "without recording a trace": {
+            "summary": "Skip the MLflow trace for this call",
+            "description": (
+                "Predictions are recorded in the Traces tab by default. Turn it "
+                "off for load tests or health probes, which would otherwise "
+                "drown the real traffic you want to look at."
+            ),
+            "value": {"rows": [[6.7, 3.0, 5.2, 2.3]], "trace": False},
+        },
+        "naming the model explicitly": {
+            "summary": "All four fields, for when more than one model is registered",
+            "value": {"rows": [[5.1, 3.5, 1.4, 0.2]],
+                      "model_name": "iris-classifier",
+                      "version": "1",
+                      "trace": True},
+        },
+    }
+
     @app.post("/predict", response_model=PredictResponse, tags=["model"])
-    def predict_rows(request: PredictRequest):
+    def predict_rows(request: PredictRequest = Body(openapi_examples=PREDICT_EXAMPLES)):
         """Score rows with the registered model.
 
         Unlike MLflow's `/invocations`, this decodes the class index into a
         label and reports confidence — a caller should not have to know that
         `2` means virginica.
+
+        Each row is one prediction: four numbers in the order given by
+        `GET /model`. `model_name` and `version` both default to the newest
+        thing the pipeline promoted.
         """
         try:
             registered = load(request.model_name, request.version)

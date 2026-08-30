@@ -171,3 +171,37 @@ def test_the_documented_example_is_the_one_that_works(client):
     example = schema["components"]["schemas"]["PredictRequest"]["example"]
     assert set(example) == {"rows"}
     assert client.post("/predict", json=example).status_code in (200, 404)
+
+
+def documented_examples(client, path: str, method: str = "post") -> dict:
+    schema = client.get("/openapi.json").json()
+    body = schema["paths"][path][method]["requestBody"]
+    return body["content"]["application/json"].get("examples", {})
+
+
+def test_every_predict_example_is_a_working_body(client):
+    """Swagger renders these as a dropdown, so each one is something a user
+    will click Execute on. An example that errors is worse than no example —
+    it teaches the wrong shape."""
+    examples = documented_examples(client, "/predict")
+    assert {"pin a registry version", "without recording a trace"} <= set(examples)
+    for name, spec in examples.items():
+        response = client.post("/predict", json=spec["value"])
+        assert response.status_code in (200, 404), f"example {name!r} -> {response.status_code} {response.text}"
+
+
+def test_predict_examples_document_version_and_trace(client):
+    """The fields exist and are useful; a body that never mentions them hides
+    them from anyone reading only the example."""
+    values = [spec["value"] for spec in documented_examples(client, "/predict").values()]
+    assert any("version" in v for v in values)
+    assert any("trace" in v for v in values)
+    assert any("model_name" in v for v in values)
+
+
+def test_every_trigger_example_is_a_working_body(client):
+    examples = documented_examples(client, "/dags/{dag_id}/runs")
+    assert examples
+    for name, spec in examples.items():
+        response = client.post("/dags/flaky/runs", json=spec["value"])
+        assert response.status_code == 202, f"example {name!r} -> {response.status_code}"
