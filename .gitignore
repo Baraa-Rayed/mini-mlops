@@ -1,0 +1,23 @@
+# Orchestrator state: the SQLite DB, run directories, gitops checkouts.
+# Runtime state, never source — this is the whole reason MINI_HOME exists.
+.mini-mlops/
+mini-home/
+
+# Promoted models. A real setup pushes these to object storage or a model
+# registry; committing binaries to git is how repos reach a gigabyte.
+model_registry/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,273 @@
+"""The command line — the only part of this project a user actually touches.
+
+Maps to: the `airflow` CLI (`dags list`, `dags trigger`, `tasks logs`,
+`scheduler`).
+
+There is no logic in this file. Every command is three lines: build a DagBag,
+build a Scheduler, call one method. If you find yourself wanting to add a
+decision here, it probably belongs in scheduler.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+from .dagbag import DEFAULT_DAGS_DIR, DagBag
+from .executors import get_executor
+from .scheduler import Scheduler, parse_schedule
+from .state import FAILED, SUCCESS, Store
+
+# ANSI colour, but only when a human is watching.
+_COLOURS = {SUCCESS: "\033[32m", FAILED: "\033[31m", "upstream_failed": "\033[33m",
+            "running": "\033[36m", "pending": "\033[90m"}
+
+
+def paint(state: str) -> str:
+    if not sys.stdout.isatty():
+        return state
+    return f"{_COLOURS.get(state, '')}{state}\033[0m"
+
+
+def ago(ts: float | None) -> str:
+    if not ts:
+        return "-"
+    delta = time.time() - ts
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if delta >= size:
+            return f"{delta / size:.0f}{unit} ago"
+    return f"{delta:.0f}s ago"
+
+
+def _bag(args) -> DagBag:
+    bag = DagBag(args.dags)
+    for path, error in bag.errors.items():
+        print(f"\033[31mfailed to import {path}\033[0m\n{error}", file=sys.stderr)
+    return bag
+
+
+def _scheduler(args) -> Scheduler:
+    executor = get_executor(args.executor, **({"image": args.image} if args.executor == "docker" else {}))
+    return Scheduler(Store(args.home), executor=executor, parallelism=args.parallelism)
+
+
+# --- commands ---------------------------------------------------------------
+def cmd_dags(args) -> int:
+    bag = _bag(args)
+    if not len(bag):
+        print(f"no DAGs under {bag.dags_dir}")
+        return 1
+    print(f"{'DAG':<24} {'SCHEDULE':<10} {'TASKS':<6} DESCRIPTION")
+    for dag in bag:
+        print(f"{dag.dag_id:<24} {str(dag.schedule or '-'):<10} {len(dag.tasks):<6} {dag.description}")
+    return 0
+
+
+def cmd_graph(args) -> int:
+    dag = _bag(args).get(args.dag_id)
+    print(f"{dag.dag_id}  (schedule={dag.schedule or 'manual'})\n")
+    for task_id in dag.topological_order():
+        task = dag.tasks[task_id]
+        deps = ", ".join(sorted(task.upstream)) or "-"
+        print(f"  {task_id:<18} <- {deps:<28} {task.ref}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    dag = _bag(args).get(args.dag_id)
+    scheduler = _scheduler(args)
+    print(f"triggering {dag.dag_id} on the {args.executor} executor")
+    run_id = scheduler.trigger(dag, trigger="manual")
+    return _report(scheduler.store, run_id)
+
+
+def cmd_resume(args) -> int:
+    scheduler = _scheduler(args)
+    run = scheduler.store.get_run(args.run_id)
+    if run is None:
+        print(f"no such run {args.run_id}", file=sys.stderr)
+        return 1
+    dag = _bag(args).get(run["dag_id"])
+    run_id = scheduler.resume(dag, args.run_id)
+    return _report(scheduler.store, run_id)
+
+
+def _report(store: Store, run_id: str) -> int:
+    run = store.get_run(run_id)
+    took = f"{(run['finished_at'] or time.time()) - run['created_at']:.1f}s"
+    print(f"\nrun {run_id}  [{paint(run['state'])}]  in {took}")
+    for task_id, row in sorted(store.task_states_full(run_id).items()):
+        took = f"{row['finished_at'] - row['started_at']:.1f}s" if row["started_at"] and row["finished_at"] else "-"
+        line = f"  {task_id:<18} {paint(row['state']):<20} try={row['try_number']} {took:>7}"
+        print(line + (f"\n      {row['error']}" if row["error"] else ""))
+    print(f"\nartifacts: {run['run_dir']}")
+    return 0 if run["state"] == SUCCESS else 1
+
+
+def cmd_runs(args) -> int:
+    store = Store(args.home)
+    rows = store.list_runs(args.dag_id, limit=args.limit)
+    if not rows:
+        print("no runs yet")
+        return 0
+    print(f"{'RUN':<44} {'DAG':<18} {'STATE':<10} {'TRIGGER':<9} CREATED")
+    for row in rows:
+        print(f"{row['run_id']:<44} {row['dag_id']:<18} {paint(row['state']):<10} "
+              f"{row['trigger']:<9} {ago(row['created_at'])}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    store = Store(args.home)
+    if store.get_run(args.run_id) is None:
+        print(f"no such run {args.run_id}", file=sys.stderr)
+        return 1
+    return _report(store, args.run_id)
+
+
+def cmd_logs(args) -> int:
+    run = Store(args.home).get_run(args.run_id)
+    if run is None:
+        print(f"no such run {args.run_id}", file=sys.stderr)
+        return 1
+    logs = sorted((Path(run["run_dir"]) / "logs").glob(f"{args.task_id}.*.log"))
+    if not logs:
+        print(f"no logs for task {args.task_id!r} in {args.run_id}", file=sys.stderr)
+        return 1
+    for path in logs if args.all_tries else logs[-1:]:
+        print(f"===== {path.name} =====")
+        print(path.read_text())
+    return 0
+
+
+def _gitops(args):
+    from .gitops import GitOps
+
+    executor = get_executor(args.executor, **({"image": args.image} if args.executor == "docker" else {}))
+    return GitOps(Store(args.home), repo=args.repo, app=args.app, branch=args.branch,
+                  path=args.path, executor=executor, parallelism=args.parallelism)
+
+
+def cmd_gitops_status(args) -> int:
+    state = _gitops(args).status()
+    print(f"app       {state['app']}")
+    print(f"repo      {state['repo']} @ {state['branch']}")
+    print(f"desired   {state['desired']}")
+    print(f"applied   {state['applied'] or '(never synced)'}")
+    print(f"status    {'in sync' if state['in_sync'] else 'OUT OF SYNC'}")
+    return 0 if state["in_sync"] else 1
+
+
+def cmd_gitops_sync(args) -> int:
+    result = _gitops(args).sync(force=args.force, only=args.dag or None)
+    if result["action"] == "none":
+        print(f"already in sync at {result['desired'][:8]} — nothing to do")
+        return 0
+    for path, error in result.get("errors", {}).items():
+        print(f"\033[31m{path}\033[0m\n{error}", file=sys.stderr)
+    print(f"{result['action']} {result['desired'][:8]}: {len(result['runs'])} run(s)")
+    for run_id in result["runs"]:
+        print(f"  {run_id}")
+    return 0 if result["action"] == "synced" else 1
+
+
+def cmd_gitops_serve(args) -> int:
+    print(f"[gitops] reconciling {args.app} from {args.repo}@{args.branch} every {args.interval}s")
+    try:
+        _gitops(args).serve(interval=args.interval, max_ticks=args.max_ticks)
+    except KeyboardInterrupt:
+        print("\n[gitops] stopped")
+    return 0
+
+
+def cmd_scheduler(args) -> int:
+    bag = _bag(args)
+    scheduler = _scheduler(args)
+    for dag in bag:
+        interval = parse_schedule(dag.schedule)
+        print(f"  {dag.dag_id:<24} every {interval}s" if interval else f"  {dag.dag_id:<24} manual only")
+    print(f"[scheduler] watching {bag.dags_dir}, tick={args.interval}s — ctrl-c to stop")
+    try:
+        scheduler.serve(bag, interval=args.interval, max_ticks=args.max_ticks)
+    except KeyboardInterrupt:
+        print("\n[scheduler] stopped")
+    return 0
+
+
+# --- wiring -----------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="mini", description="a very small MLOps orchestrator")
+    ap.add_argument("--home", default=None, help="state directory (default $MINI_HOME or ~/.mini-mlops)")
+    ap.add_argument("--dags", default=DEFAULT_DAGS_DIR, help="folder to scan for DAGs")
+    ap.add_argument("--executor", default="local", choices=["local", "docker"])
+    ap.add_argument("--image", default="mini-mlops:latest", help="image for the docker executor")
+    ap.add_argument("--parallelism", type=int, default=4, help="max tasks running at once")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("dags", help="list discovered DAGs").set_defaults(func=cmd_dags)
+
+    p = sub.add_parser("graph", help="show a DAG's tasks in dependency order")
+    p.add_argument("dag_id")
+    p.set_defaults(func=cmd_graph)
+
+    p = sub.add_parser("run", help="trigger a DAG now and wait for it")
+    p.add_argument("dag_id")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("resume", help="re-drive a run abandoned by a dead scheduler")
+    p.add_argument("run_id")
+    p.set_defaults(func=cmd_resume)
+
+    p = sub.add_parser("runs", help="run history")
+    p.add_argument("dag_id", nargs="?")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_runs)
+
+    p = sub.add_parser("show", help="task states for one run")
+    p.add_argument("run_id")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("logs", help="stdout/stderr of one task")
+    p.add_argument("run_id")
+    p.add_argument("task_id")
+    p.add_argument("--all-tries", action="store_true", help="show every attempt, not just the last")
+    p.set_defaults(func=cmd_logs)
+
+    g = sub.add_parser("gitops", help="reconcile pipelines from a git repo")
+    g.add_argument("--repo", required=True, help="git URL or local path")
+    g.add_argument("--app", default="default", help="name for this reconciliation target")
+    g.add_argument("--branch", default="main")
+    g.add_argument("--path", default="pipelines", help="DAG folder within the repo")
+    gsub = g.add_subparsers(dest="gitops_command", required=True)
+
+    gsub.add_parser("status", help="compare git HEAD to the applied revision").set_defaults(func=cmd_gitops_status)
+
+    gp = gsub.add_parser("sync", help="reconcile once")
+    gp.add_argument("--force", action="store_true", help="sync even if already in sync")
+    gp.add_argument("--dag", action="append", help="only this DAG (repeatable)")
+    gp.set_defaults(func=cmd_gitops_sync)
+
+    gp = gsub.add_parser("serve", help="poll git and reconcile forever")
+    gp.add_argument("--interval", type=float, default=30.0)
+    gp.add_argument("--max-ticks", type=int, default=None)
+    gp.set_defaults(func=cmd_gitops_serve)
+
+    p = sub.add_parser("scheduler", help="run the scheduling loop")
+    p.add_argument("--interval", type=float, default=5.0, help="seconds between ticks")
+    p.add_argument("--max-ticks", type=int, default=None, help="stop after N ticks (for tests/demos)")
+    p.set_defaults(func=cmd_scheduler)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.home is None:
+        from .state import HOME
+        args.home = HOME
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

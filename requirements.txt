@@ -1,0 +1,9 @@
+# Runtime deps for the task image. The orchestrator itself needs nothing
+# beyond the standard library — sqlite3, subprocess and argparse are all it
+# uses. Everything below is here for the example pipelines.
+scikit-learn>=1.3
+pandas>=2.0
+joblib>=1.3
+
+# Dev only
+pytest>=7.4
