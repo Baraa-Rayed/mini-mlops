@@ -326,6 +326,53 @@ def cmd_ui(args) -> int:
         return 0
 
 
+def cmd_serve(args) -> int:
+    """Serve the registered model over HTTP, so it can be called by anything.
+
+    `mini predict` is fine for a human at a terminal, but a model reachable
+    only from one shell on one machine is not deployed. MLflow ships a scoring
+    server; this wires it to our registry and fixes the two things that make
+    the raw command fail here.
+    """
+    import subprocess
+
+    from .tracking import DEFAULT_MODEL_NAME, latest_version, tracking_uri
+
+    name = args.model or DEFAULT_MODEL_NAME
+    version = args.version
+    if version is None:
+        found = latest_version(name)
+        if found is None:
+            print(f"no registered model {name!r} — run `mini run iris` first", file=sys.stderr)
+            return 1
+        version = found.version
+
+    env = os.environ.copy()
+    env["MLFLOW_TRACKING_URI"] = tracking_uri()
+    # The scoring server shells out to `bash -c 'exec uvicorn ...'`, and a bare
+    # `uvicorn` resolves against PATH — which may belong to a different
+    # environment that cannot import mlflow, failing with a bare
+    # ModuleNotFoundError. Put this interpreter's bin directory first.
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env.get("PATH", "")])
+
+    uri = f"models:/{name}/{version}"
+    print(f"serving   {uri}")
+    print(f"tracking  {tracking_uri()}")
+    print(f"endpoint  http://{args.host}:{args.port}/invocations")
+    print(f"health    http://{args.host}:{args.port}/ping")
+    print("          ctrl-c to stop\n")
+    cmd = [sys.executable, "-m", "mlflow", "models", "serve", "-m", uri,
+           "--host", args.host, "--port", str(args.port),
+           # `local` reuses this environment. The default rebuilds the model's
+           # recorded environment from scratch, which is correct for a real
+           # deployment and needlessly slow for poking at it locally.
+           "--env-manager", args.env_manager]
+    try:
+        return subprocess.call(cmd, env=env)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_predict(args) -> int:
     """Score a row with the model MLflow currently has registered.
 
@@ -499,6 +546,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="extra Host header to accept, e.g. a DNS name or reverse-proxy "
                         "domain (repeatable); MLflow 403s anything it does not recognise")
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser("serve", help="serve the registered model over HTTP")
+    p.add_argument("--model", default=None, help="registered model name")
+    p.add_argument("--version", default=None, help="version to serve (default: newest)")
+    p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to expose on the network")
+    p.add_argument("--port", type=int, default=5555)
+    p.add_argument("--env-manager", default="local", choices=["local", "virtualenv", "uv"],
+                   help="'local' reuses this environment; the others rebuild the model's own")
+    p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("predict", help="score a row with the registered model")
     p.add_argument("values", nargs="*", help='one row per argument, e.g. "5.1,3.5,1.4,0.2"')
