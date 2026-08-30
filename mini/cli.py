@@ -193,6 +193,83 @@ def cmd_reap(args) -> int:
     return 0
 
 
+def local_hostnames() -> list[str]:
+    """Every name and address this machine answers to.
+
+    `socket.gethostname()` is not enough. A VPN such as Tailscale adds an
+    interface in 100.64.0.0/10 (RFC 6598 shared address space) which is
+    neither the machine's hostname nor inside the RFC 1918 ranges MLflow
+    trusts by default — so browsing over the VPN is refused while the LAN
+    address works. Enumerating the interfaces is what catches it.
+    """
+    import socket
+    import subprocess
+
+    names: list[str] = []
+    try:
+        hostname = socket.gethostname()
+        names += [hostname, socket.getfqdn()]
+        names += socket.gethostbyname_ex(hostname)[2]
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(["ip", "-o", "-4", "addr", "show"],
+                              capture_output=True, text=True, timeout=5)
+        for line in proc.stdout.splitlines():
+            fields = line.split()
+            if "inet" in fields:
+                names.append(fields[fields.index("inet") + 1].split("/")[0])
+    except (OSError, subprocess.SubprocessError):
+        pass  # not Linux, or no iproute2 — --allow-host still works
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def security_env(host: str, port: int, allow_host: list[str] | None,
+                 base: dict) -> tuple[dict, list[str]]:
+    """Relax MLflow's two security middlewares enough to serve a remote browser.
+
+    Returns the environment to launch with, and the names it now trusts (empty
+    when binding to loopback, where MLflow's defaults already work).
+
+    Serving the UI anywhere but loopback trips *both* guards, and fixing one
+    leaves a UI that loads and then fails on every write:
+
+        HostValidationMiddleware  rejects an unrecognised `Host` header
+        CORSBlockingMiddleware    rejects POST/PUT/DELETE on /api/ and
+                                  /ajax-api/ unless `Origin` is localhost
+
+    A browser sends `Origin` even for same-origin POSTs, so any remote address
+    counts as cross-origin no matter that it is the same server.
+
+    Both variables *replace* MLflow's defaults rather than extending them, so
+    the defaults are restated here — otherwise trusting a VPN address would
+    silently break loopback.
+    """
+    env = dict(base)
+    names = list(allow_host or [])
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return env, []
+    names += local_hostnames()
+    names = list(dict.fromkeys(n for n in names if n))
+
+    if not env.get("MLFLOW_SERVER_ALLOWED_HOSTS"):
+        defaults = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0",
+                    "localhost:*", "127.0.0.1:*", "[[]::1]:*", "0.0.0.0:*",
+                    "192.168.*", "10.*", *[f"172.{n}.*" for n in range(16, 32)]]
+        allowed = [f"{n}:*" for n in names] + names + defaults
+        env["MLFLOW_SERVER_ALLOWED_HOSTS"] = ",".join(dict.fromkeys(allowed))
+
+    if not env.get("MLFLOW_SERVER_CORS_ALLOWED_ORIGINS"):
+        origins: list[str] = []
+        for name in names:
+            origins += [f"http://{name}:{port}", f"https://{name}:{port}",
+                        f"http://{name}:*", f"https://{name}:*"]
+        origins += ["http://localhost:*", "http://127.0.0.1:*"]
+        env["MLFLOW_SERVER_CORS_ALLOWED_ORIGINS"] = ",".join(dict.fromkeys(origins))
+
+    return env, names
+
+
 def cmd_ui(args) -> int:
     """Open the MLflow dashboard against *our* store.
 
@@ -200,32 +277,29 @@ def cmd_ui(args) -> int:
     which is empty and looks like nothing ever ran. Pointing it at the same
     backend the pipelines write to is the whole value of this command.
     """
-    import socket
     import subprocess
 
     from .tracking import artifact_root, tracking_uri
 
-    # MLflow rejects any Host header it does not recognise, returning
-    # "Invalid Host header - possible DNS rebinding attack detected". Its
-    # defaults cover loopback and private IP ranges but *not hostnames*, so
-    # binding to 0.0.0.0 and then browsing to http://<machine-name>:5000 —
-    # the obvious thing to do — gets a 403 while the IP works fine.
+    # MLflow guards the server with TWO independent middlewares, and serving
+    # the UI on anything but loopback trips both:
     #
-    # Note /health and /version are exempt from the check, so a health probe
-    # succeeds against a server the browser cannot use. Do not health-check
-    # your way to "it works".
-    env = os.environ.copy()
-    extra = list(args.allow_host or [])
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
-        extra += [socket.gethostname(), socket.getfqdn()]
-    if extra and not env.get("MLFLOW_SERVER_ALLOWED_HOSTS"):
-        # The env var *replaces* MLflow's defaults rather than adding to them,
-        # so they have to be restated or loopback access breaks.
-        defaults = ["localhost", "127.0.0.1", "[::1]", "0.0.0.0",
-                    "localhost:*", "127.0.0.1:*", "[[]::1]:*", "0.0.0.0:*",
-                    "192.168.*", "10.*", *[f"172.{n}.*" for n in range(16, 32)]]
-        names = [f"{h}:*" for h in extra] + extra + defaults
-        env["MLFLOW_SERVER_ALLOWED_HOSTS"] = ",".join(dict.fromkeys(names))
+    #   HostValidationMiddleware  rejects an unrecognised `Host` header
+    #                             ("possible DNS rebinding attack detected")
+    #   CORSBlockingMiddleware    rejects POST/PUT/DELETE on /api/ and
+    #                             /ajax-api/ when `Origin` is not localhost
+    #
+    # Fixing only the first gets you a UI that loads and then fails on every
+    # write — the browser sends an Origin header even for same-origin POSTs,
+    # so a remote address is treated as cross-origin regardless.
+    #
+    # Both env vars *replace* MLflow's defaults rather than extending them,
+    # so the defaults are restated here or loopback access breaks.
+    #
+    # Note /health and /version are exempt from host validation, so a health
+    # probe succeeds against a server no browser can use.
+    env, names = security_env(args.host, args.port, args.allow_host, os.environ.copy())
+    remote = bool(names)
 
     # `sys.executable -m mlflow`, not the bare `mlflow` console script: the
     # script only exists on PATH if this environment's bin directory happens
@@ -239,10 +313,10 @@ def cmd_ui(args) -> int:
            "--host", args.host, "--port", str(args.port)]
     print(f"tracking  {tracking_uri()}")
     print(f"artifacts {artifact_root()}")
-    if args.host == "0.0.0.0":
-        addresses = sorted({socket.gethostbyname(socket.gethostname()), "127.0.0.1"})
-        print(f"reachable {', '.join(f'http://{a}:{args.port}' for a in addresses)}")
-        print(f"          http://{socket.gethostname()}:{args.port}  (hostname allowed)")
+    if remote:
+        print("reachable " + f"http://127.0.0.1:{args.port}")
+        for host in names:
+            print(f"          http://{host}:{args.port}")
     else:
         print(f"opening   http://{args.host}:{args.port}")
     print("          ctrl-c to stop\n")
