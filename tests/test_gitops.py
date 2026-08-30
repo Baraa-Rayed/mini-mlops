@@ -180,3 +180,15 @@ def test_serve_reconciles_then_stops(app, origin):
 def test_executor_import_root_points_at_the_checkout(app):
     app.checkout()
     assert app.scheduler().executor.import_root == app.workdir.resolve()
+
+
+def test_supplied_executor_is_retargeted_at_the_checkout(tmp_path, origin):
+    """The CLI always passes an executor, so a default-only retarget would
+    leave real runs importing from the wrong checkout."""
+    store = Store(tmp_path / "home2")
+    supplied = LocalExecutor()  # built with import_root = this project
+    app = GitOps(store, repo=str(origin), app="explicit", branch="main",
+                 workdir=tmp_path / "checkout2", executor=supplied)
+    result = app.sync()
+    assert result["action"] == "synced"
+    assert store.results(result["runs"][0])["emit"]["marker"] == "v1"

@@ -140,7 +140,16 @@ class GitOps:
         return DagBag(self.workdir / self.path, import_root=self.workdir)
 
     def scheduler(self) -> Scheduler:
-        executor = self._executor or LocalExecutor(import_root=self.workdir)
+        """Whatever executor we were handed, retarget it at the checkout.
+
+        Not `LocalExecutor(import_root=...) if none was supplied` — that only
+        points a *default* executor at the working copy and silently lets a
+        caller-supplied one keep importing from wherever it was built. Running
+        the synced revision's code is the entire contract of this class, so it
+        is set here unconditionally rather than left to the caller.
+        """
+        executor = self._executor or LocalExecutor()
+        executor.import_root = self.workdir.resolve()
         return Scheduler(self.store, executor=executor, parallelism=self.parallelism)
 
     def sync(self, force: bool = False, only: list[str] | None = None) -> dict:
