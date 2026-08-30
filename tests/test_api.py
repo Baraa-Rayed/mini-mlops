@@ -129,3 +129,16 @@ def test_openapi_schema_is_served(client):
     assert "/predict" in schema["paths"]
     assert "/dags/{dag_id}/runs" in schema["paths"]
     assert client.get("/docs").status_code == 200
+
+
+def test_root_redirects_to_the_docs(client):
+    """Browsing to the bare host is the first thing anyone does; a 404 there
+    reads as a broken server rather than a wrong path."""
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code in (307, 302)
+    assert response.headers["location"] == "/docs"
+    assert client.get("/").status_code == 200
+
+
+def test_favicon_is_answered_quietly(client):
+    assert client.get("/favicon.ico").status_code == 204

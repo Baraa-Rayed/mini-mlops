@@ -149,6 +149,26 @@ def create_app(home: Path | str | None = None, dags_dir: Path | str = DEFAULT_DA
                          tasks=tasks, results=store.results(run_id))
 
     # --- health ---------------------------------------------------------
+    @app.get("/", include_in_schema=False)
+    def index():
+        """Send the root to the docs.
+
+        Browsing to the bare host is the first thing anyone does, and a 404
+        there reads as "the server is broken" rather than "the interesting
+        page is one path over".
+        """
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse("/docs")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon():
+        """Browsers ask for this unprompted; answering 204 keeps the log clean
+        instead of filling it with 404s nobody caused."""
+        from fastapi import Response
+
+        return Response(status_code=204)
+
     @app.get("/health", tags=["system"])
     def health() -> dict:
         return {"status": "ok", "dags": len(bag), "home": str(store.home)}
