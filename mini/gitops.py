@@ -121,10 +121,25 @@ class GitOps:
             self.workdir.parent.mkdir(parents=True, exist_ok=True)
             git("clone", "--branch", self.branch, self.repo, str(self.workdir))
         else:
+            self._reconcile_remote()
             git("fetch", "origin", self.branch, cwd=self.workdir)
             git("reset", "--hard", f"origin/{self.branch}", cwd=self.workdir)
         self._purge_bytecode()
         return self.workdir
+
+    def _reconcile_remote(self) -> None:
+        """Point `origin` at the repo we were actually asked for.
+
+        The working copy is keyed by `app`, not by URL, so an existing
+        checkout survives a change of `--repo` — and would keep fetching from
+        the old remote while reporting the new one. Deploying from a different
+        repository than the one you named is precisely the class of bug GitOps
+        exists to make impossible, so the URL is reconciled like everything
+        else rather than trusted from clone time.
+        """
+        current = git("remote", "get-url", "origin", cwd=self.workdir)
+        if current != self.repo:
+            git("remote", "set-url", "origin", self.repo, cwd=self.workdir)
 
     def _purge_bytecode(self) -> None:
         """Delete every __pycache__ in the working copy after moving commits.
@@ -220,7 +235,14 @@ class GitOps:
                 result = self.sync()
                 if result["action"] != "none":
                     print(f"[gitops] {self.app}: {result['action']} {result['desired'][:8]} "
-                          f"({len(result['runs'])} run(s))")
+                          f"({len(result['runs'])} run(s))", flush=True)
+                else:
+                    # Say something on a quiet tick. A controller that prints
+                    # only on change is indistinguishable from one that has
+                    # hung, and "is it still alive?" is the first question
+                    # anyone asks of a loop that polls every 30 seconds.
+                    print(f"[gitops] {self.app}: in sync at {result['desired'][:8]}, "
+                          f"next check in {interval:g}s", flush=True)
             except GitError as exc:
                 # A network blip must not kill the controller.
                 print(f"[gitops] {self.app}: {exc}")

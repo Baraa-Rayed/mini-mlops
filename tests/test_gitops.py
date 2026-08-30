@@ -168,6 +168,34 @@ def test_local_edits_to_the_checkout_are_discarded(app):
     assert "vandalised" not in stray.read_text()
 
 
+def test_changing_the_repo_url_retargets_an_existing_checkout(tmp_path, origin):
+    """The workdir is keyed by app, not URL, so an existing checkout outlives
+    a change of --repo. It must follow the new remote, not keep fetching the
+    old one while reporting the new."""
+    store = Store(tmp_path / "home")
+    workdir = tmp_path / "shared"
+
+    first = GitOps(store, repo=str(origin), app="a", branch="main", workdir=workdir)
+    first.checkout()
+    assert git("remote", "get-url", "origin", cwd=workdir) == str(origin)
+
+    other = tmp_path / "other"
+    git("clone", "-q", str(origin), str(other))
+    second = GitOps(store, repo=str(other), app="a", branch="main", workdir=workdir)
+    second.checkout()
+    assert git("remote", "get-url", "origin", cwd=workdir) == str(other)
+
+
+def test_serve_reports_a_heartbeat_when_in_sync(app, capsys):
+    """A controller that prints only on change looks hung."""
+    app.serve(interval=0, max_ticks=1)   # first tick syncs
+    capsys.readouterr()
+    app.serve(interval=30, max_ticks=1)  # second tick has nothing to do
+    out = capsys.readouterr().out
+    assert "in sync" in out
+    assert "next check in 30s" in out
+
+
 def test_serve_reconciles_then_stops(app, origin):
     app.serve(interval=0, max_ticks=1)
     assert app.status()["in_sync"] is True
