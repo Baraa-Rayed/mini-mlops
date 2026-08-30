@@ -11,6 +11,8 @@ the only part of the system that can actually surprise us.
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from mini.dag import DAG, Task
@@ -180,6 +182,63 @@ def test_killed_process_still_reports_a_failure(scheduler, store):
     run_id = scheduler.trigger(dag)
     assert store.get_run(run_id)["state"] == FAILED
     assert "without writing a result" in store.task_states_full(run_id)["dies"]["error"]
+
+
+def test_store_survives_concurrent_access(tmp_path):
+    """Regression for `InterfaceError: bad parameter or other API misuse`.
+
+    A sqlite3.Connection keeps an internal cache of prepared statements. Two
+    threads running the *same* SQL share one cached statement, and rebinding
+    it while the other thread is mid-fetch is an API misuse. `threadsafety ==
+    3` does not save us: it covers the C library, not the module's cache.
+
+    Guarding only the writes left this open on every read. Hammering the store
+    directly reproduces in milliseconds what a subprocess-paced DAG hits only
+    intermittently — which is why the fan-out test below is not enough on its
+    own.
+    """
+    store = Store(tmp_path / "home")
+    run_id = store.create_run("concurrent")["run_id"]
+    for i in range(10):
+        store.init_task(run_id, f"t{i:02d}")
+    store.set_task_state(run_id, "t00", SUCCESS, result='{"v": 1}')
+
+    errors: list[Exception] = []
+
+    def hammer():
+        try:
+            for _ in range(150):
+                store.results(run_id)
+                store.task_states(run_id)
+                store.task_states_full(run_id)
+                store.get_run(run_id)
+                store.set_task_state(run_id, "t01", RUNNING)
+        except Exception as exc:  # noqa: BLE001 — the assertion is "none of these"
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, f"{len(errors)} thread(s) failed, first: {errors[0]!r}"
+
+
+def test_many_parallel_tasks_do_not_misuse_the_connection(tmp_path):
+    """Regression: every worker thread calls `store.results()` before running,
+    sharing one sqlite3 connection with the run loop. Guarding only the writes
+    left the reads racing, which surfaces as an intermittent
+    `InterfaceError: bad parameter or other API misuse` — and it surfaces under
+    fan-out, not in a two-task DAG, which is why the earlier tests missed it.
+    """
+    store = Store(tmp_path / "home")
+    with DAG("wide") as dag:
+        root = Task("root", fixtures.ok)
+        root >> [Task(f"leaf{i:02d}", fixtures.echo_upstream) for i in range(12)]
+    run_id = Scheduler(store, executor=LocalExecutor(), parallelism=8).trigger(dag)
+    assert store.get_run(run_id)["state"] == SUCCESS
+    assert len(store.task_states(run_id)) == 13
 
 
 def test_run_artifacts_are_isolated_per_run(scheduler, store):

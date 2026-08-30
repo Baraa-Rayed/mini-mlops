@@ -27,6 +27,7 @@ pipeline code ran", which is much simpler.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -42,14 +43,39 @@ class GitError(RuntimeError):
     pass
 
 
+AUTH_HINT = (
+    "\n\nThis looks like an authentication failure. A reconcile loop has no one to "
+    "answer a password prompt, so credentials must already be in the environment:\n"
+    "  * SSH:   use a URL like git@github.com:owner/repo.git (or an ~/.ssh/config "
+    "Host alias) whose key is already authorised\n"
+    "  * HTTPS: configure a credential helper, or embed a token in the URL\n"
+    "Private repositories over plain https:// cannot work here."
+)
+
+
 def git(*args: str, cwd: Path | None = None) -> str:
-    proc = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True,
-        env={"GIT_TERMINAL_PROMPT": "0", "PATH": __import__("os").environ.get("PATH", "")},
-    )
+    # Inherit the real environment. An earlier version passed only PATH, which
+    # dropped HOME — and without HOME, ssh cannot find ~/.ssh/config or any
+    # key, so every SSH remote failed with a confusing "permission denied".
+    env = os.environ.copy()
+    # Never prompt. This runs unattended in `serve()`, where a credential
+    # prompt would hang the controller forever instead of failing a sync.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env)
     if proc.returncode != 0:
-        raise GitError(f"git {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        detail = proc.stderr.strip() or proc.stdout.strip()
+        hint = AUTH_HINT if _looks_like_auth_failure(detail) else ""
+        raise GitError(f"git {' '.join(args)} failed: {detail}{hint}")
     return proc.stdout.strip()
+
+
+def _looks_like_auth_failure(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        needle in lowered
+        for needle in ("could not read username", "authentication failed", "permission denied",
+                       "terminal prompts disabled", "repository not found")
+    )
 
 
 class GitOps:

@@ -80,6 +80,27 @@ class Store:
             self.db.executescript(SCHEMA)
             self.db.commit()
 
+    # --- connection access --------------------------------------------------
+    # A sqlite3.Connection is one shared resource, and `check_same_thread=False`
+    # only silences the thread check — it does not make concurrent use safe.
+    # Two threads stepping on the same connection raise
+    # `InterfaceError: bad parameter or other API misuse`, intermittently and
+    # under load. So *every* statement goes through these helpers, reads
+    # included: guarding only the writes leaves exactly the race that a
+    # scheduler running tasks in parallel is guaranteed to hit.
+    def _all(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def _one(self, sql: str, args: tuple = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self.db.execute(sql, args).fetchone()
+
+    def _write(self, sql: str, args: tuple = ()) -> None:
+        with self._lock:
+            self.db.execute(sql, args)
+            self.db.commit()
+
     # --- runs ---------------------------------------------------------------
     def create_run(self, dag_id: str, trigger: str = "manual") -> sqlite3.Row:
         run_id = f"{dag_id}__{time.strftime('%Y%m%dT%H%M%S')}__{uuid.uuid4().hex[:6]}"
@@ -95,14 +116,10 @@ class Store:
             return self.get_run(run_id)
 
     def get_run(self, run_id: str) -> sqlite3.Row:
-        return self.db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        return self._one("SELECT * FROM runs WHERE run_id=?", (run_id,))
 
     def finish_run(self, run_id: str, state: str) -> None:
-        with self._lock:
-            self.db.execute(
-                "UPDATE runs SET state=?, finished_at=? WHERE run_id=?", (state, time.time(), run_id)
-            )
-            self.db.commit()
+        self._write("UPDATE runs SET state=?, finished_at=? WHERE run_id=?", (state, time.time(), run_id))
 
     def list_runs(self, dag_id: str | None = None, limit: int = 20) -> list[sqlite3.Row]:
         sql = "SELECT * FROM runs"
@@ -111,23 +128,19 @@ class Store:
             sql += " WHERE dag_id=?"
             args = (dag_id,)
         sql += " ORDER BY created_at DESC LIMIT ?"
-        return self.db.execute(sql, args + (limit,)).fetchall()
+        return self._all(sql, args + (limit,))
 
     # --- task instances -----------------------------------------------------
     def init_task(self, run_id: str, task_id: str) -> None:
-        with self._lock:
-            self.db.execute(
-                "INSERT OR IGNORE INTO task_instances (run_id, task_id, state) VALUES (?,?,?)",
-                (run_id, task_id, PENDING),
-            )
-            self.db.commit()
+        self._write(
+            "INSERT OR IGNORE INTO task_instances (run_id, task_id, state) VALUES (?,?,?)",
+            (run_id, task_id, PENDING),
+        )
 
     def set_task_state(self, run_id: str, task_id: str, state: str, **fields) -> None:
         cols = ", ".join(f"{k}=?" for k in fields)
         sql = f"UPDATE task_instances SET state=?{', ' + cols if cols else ''} WHERE run_id=? AND task_id=?"
-        with self._lock:
-            self.db.execute(sql, (state, *fields.values(), run_id, task_id))
-            self.db.commit()
+        self._write(sql, (state, *fields.values(), run_id, task_id))
 
     def bump_try(self, run_id: str, task_id: str) -> int:
         # Increment-then-read: two statements that must not interleave with
@@ -144,49 +157,45 @@ class Store:
         return row["try_number"]
 
     def task_states(self, run_id: str) -> dict[str, str]:
-        rows = self.db.execute(
-            "SELECT task_id, state FROM task_instances WHERE run_id=?", (run_id,)
-        ).fetchall()
+        rows = self._all("SELECT task_id, state FROM task_instances WHERE run_id=?", (run_id,))
         return {r["task_id"]: r["state"] for r in rows}
 
     def task_states_full(self, run_id: str) -> dict[str, sqlite3.Row]:
-        rows = self.db.execute(
-            "SELECT * FROM task_instances WHERE run_id=?", (run_id,)
-        ).fetchall()
+        rows = self._all("SELECT * FROM task_instances WHERE run_id=?", (run_id,))
         return {r["task_id"]: r for r in rows}
 
     def results(self, run_id: str) -> dict[str, dict]:
-        """Every succeeded task's return value — this is our XCom."""
-        rows = self.db.execute(
+        """Every succeeded task's return value — this is our XCom.
+
+        Called from worker threads, concurrently with the run loop's own
+        reads and writes — which is why it must go through `_all`.
+        """
+        rows = self._all(
             "SELECT task_id, result FROM task_instances WHERE run_id=? AND state=?",
             (run_id, SUCCESS),
-        ).fetchall()
+        )
         return {r["task_id"]: json.loads(r["result"] or "null") for r in rows}
 
     # --- scheduling ---------------------------------------------------------
     def last_run_at(self, dag_id: str) -> float | None:
-        row = self.db.execute("SELECT last_run_at FROM schedules WHERE dag_id=?", (dag_id,)).fetchone()
+        row = self._one("SELECT last_run_at FROM schedules WHERE dag_id=?", (dag_id,))
         return row["last_run_at"] if row else None
 
     def mark_scheduled(self, dag_id: str, when: float) -> None:
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO schedules (dag_id, last_run_at) VALUES (?,?)"
-                " ON CONFLICT(dag_id) DO UPDATE SET last_run_at=excluded.last_run_at",
-                (dag_id, when),
-            )
-            self.db.commit()
+        self._write(
+            "INSERT INTO schedules (dag_id, last_run_at) VALUES (?,?)"
+            " ON CONFLICT(dag_id) DO UPDATE SET last_run_at=excluded.last_run_at",
+            (dag_id, when),
+        )
 
     # --- gitops -------------------------------------------------------------
     def applied_revision(self, app_name: str) -> str | None:
-        row = self.db.execute("SELECT revision FROM applied WHERE app_name=?", (app_name,)).fetchone()
+        row = self._one("SELECT revision FROM applied WHERE app_name=?", (app_name,))
         return row["revision"] if row else None
 
     def set_applied_revision(self, app_name: str, revision: str) -> None:
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO applied (app_name, revision, synced_at) VALUES (?,?,?)"
-                " ON CONFLICT(app_name) DO UPDATE SET revision=excluded.revision, synced_at=excluded.synced_at",
-                (app_name, revision, time.time()),
-            )
-            self.db.commit()
+        self._write(
+            "INSERT INTO applied (app_name, revision, synced_at) VALUES (?,?,?)"
+            " ON CONFLICT(app_name) DO UPDATE SET revision=excluded.revision, synced_at=excluded.synced_at",
+            (app_name, revision, time.time()),
+        )
