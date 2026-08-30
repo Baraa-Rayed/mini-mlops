@@ -3,8 +3,12 @@
 .mini-mlops/
 mini-home/
 
-# Promoted models. A real setup pushes these to object storage or a model
-# registry; committing binaries to git is how repos reach a gigabyte.
+# MLflow's store. Runs, metrics and model artifacts live beside the
+# orchestrator's own state under MINI_HOME, but a stray `mlflow ui` in this
+# directory creates ./mlruns -- committing binaries is how repos reach a gigabyte.
+mlruns/
+mlartifacts/
+mlflow.db
 model_registry/
 
 # Python

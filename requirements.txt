@@ -1,9 +1,13 @@
-# Runtime deps for the task image. The orchestrator itself needs nothing
-# beyond the standard library — sqlite3, subprocess and argparse are all it
-# uses. Everything below is here for the example pipelines.
+# The task image / pipeline runtime. The orchestrator itself needs nothing
+# beyond the standard library -- sqlite3, subprocess and argparse are all it
+# uses. Everything below is for the pipelines and the tracking UI.
 scikit-learn>=1.3
 pandas>=2.0
 joblib>=1.3
+
+# Experiment tracking and the model registry. Note the registry requires a
+# database-backed store; a file:// store cannot host one.
+mlflow>=3.0
 
 # Dev only
 pytest>=7.4

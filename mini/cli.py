@@ -11,6 +11,7 @@ decision here, it probably belongs in scheduler.py.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -192,37 +193,76 @@ def cmd_reap(args) -> int:
     return 0
 
 
+def cmd_ui(args) -> int:
+    """Open the MLflow dashboard against *our* store.
+
+    Bare `mlflow ui` reads ./mlruns in whatever directory you happen to be in,
+    which is empty and looks like nothing ever ran. Pointing it at the same
+    backend the pipelines write to is the whole value of this command.
+    """
+    import subprocess
+
+    from .tracking import artifact_root, tracking_uri
+
+    # `sys.executable -m mlflow`, not the bare `mlflow` console script: the
+    # script only exists on PATH if this environment's bin directory happens
+    # to be active, which is not true when the orchestrator is invoked by
+    # absolute interpreter path, from a venv, or by the scheduler. Going
+    # through the running interpreter guarantees the same environment that
+    # wrote the runs is the one that reads them.
+    cmd = [sys.executable, "-m", "mlflow", "ui",
+           "--backend-store-uri", tracking_uri(),
+           "--default-artifact-root", artifact_root(),
+           "--host", args.host, "--port", str(args.port)]
+    print(f"tracking  {tracking_uri()}")
+    print(f"artifacts {artifact_root()}")
+    print(f"opening   http://{args.host}:{args.port}  — ctrl-c to stop\n")
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_predict(args) -> int:
-    """Load whatever the pipeline last promoted, and score a row with it.
+    """Score a row with the model MLflow currently has registered.
 
     The counterpart to `register`: training is only half a pipeline, and a
     model nobody can call is indistinguishable from one that was never built.
-    It reads `latest.json` rather than a path you supply, so what answers here
-    is by construction what the quality gate actually approved.
+    It resolves `models:/<name>/<version>` from the registry rather than a
+    path you supply, so what answers here is by construction what the quality
+    gate approved and promoted.
     """
-    import json as jsonlib
+    from .tracking import DEFAULT_MODEL_NAME, latest_version, tracking_uri
 
-    registry = Path(os.environ.get("MINI_REGISTRY", "model_registry"))
-    latest = registry / "latest.json"
-    if not latest.exists():
-        print(f"no registered model at {latest} — run `mini run iris` first", file=sys.stderr)
+    name = args.model or DEFAULT_MODEL_NAME
+    try:
+        version = latest_version(name)
+    except Exception as exc:  # noqa: BLE001 — a missing store is a normal first-run state
+        print(f"cannot reach the MLflow registry at {tracking_uri()}: {exc}", file=sys.stderr)
+        return 1
+    if version is None:
+        print(f"no registered model {name!r} — run `mini run iris` first", file=sys.stderr)
         return 1
 
-    entry = jsonlib.loads(latest.read_text())
-    model_path = Path(entry["model"])
-    if not model_path.exists():
-        print(f"registry points at a missing file: {model_path}", file=sys.stderr)
-        return 1
-
-    import joblib
+    import mlflow
     import pandas as pd
 
-    features, classes = entry["features"], entry["classes"]
+    mlflow.set_tracking_uri(tracking_uri())
+    tags = version.tags or {}
+    # Schema travels with the model: the signature carries column names, and
+    # the class labels ride along as a tag so a bare index never reaches a user.
+    model = mlflow.sklearn.load_model(f"models:/{name}/{version.version}")
+    signature_inputs = getattr(getattr(model, "feature_names_in_", None), "tolist", lambda: None)()
+    features = signature_inputs or json.loads(tags.get("features", "[]"))
+    classes = json.loads(tags.get("classes", "[]"))
+
     if args.show:
-        print(f"model     {entry['kind']}  ({entry['version']})")
-        print(f"accuracy  {entry['accuracy']:.4f}")
+        print(f"model     {name} v{version.version}  ({tags.get('kind', 'unknown')})")
+        print(f"accuracy  {tags.get('accuracy', '?')}")
+        print(f"source    run {tags.get('mini.run_id', '?')}")
         print(f"features  {', '.join(features)}")
         print(f"classes   {', '.join(classes)}")
+        print(f"uri       models:/{name}/{version.version}")
         return 0
 
     rows = []
@@ -233,8 +273,6 @@ def cmd_predict(args) -> int:
                   file=sys.stderr)
             return 1
         rows.append([float(p) for p in parts])
-
-    model = joblib.load(model_path)
     # A DataFrame with the training column names, not a bare array: sklearn
     # matches features by position but warns when the names go missing, and
     # a silent column-order mismatch is a wrong answer rather than an error.
@@ -351,8 +389,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="list what would be reaped, change nothing")
     p.set_defaults(func=cmd_reap)
 
-    p = sub.add_parser("predict", help="score a row with the last registered model")
+    p = sub.add_parser("ui", help="open the MLflow dashboard on this project's store")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=5000)
+    p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser("predict", help="score a row with the registered model")
     p.add_argument("values", nargs="*", help='one row per argument, e.g. "5.1,3.5,1.4,0.2"')
+    p.add_argument("--model", default=None, help="registered model name")
     p.add_argument("--show", action="store_true", help="describe the registered model and exit")
     p.set_defaults(func=cmd_predict)
 

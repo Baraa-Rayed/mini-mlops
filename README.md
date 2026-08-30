@@ -1,9 +1,10 @@
 # mini-mlops
 
-A workflow orchestrator small enough to read in one sitting — ~800 lines of
-executable Python (1,500 counting the comments that explain it), using nothing
-outside the standard library. The example pipelines need scikit-learn; the
-orchestrator itself needs `sqlite3`, `subprocess` and `argparse`.
+A workflow orchestrator small enough to read in one sitting — ~900 lines of
+executable Python, using nothing outside the standard library, with MLflow
+wired in for experiment tracking and the model registry. The orchestrator core
+itself needs only `sqlite3`, `subprocess` and `argparse`; the pipelines need
+scikit-learn and MLflow.
 
 It is not a toy re-implementation of Airflow. It is an attempt to isolate the
 handful of ideas that *every* orchestrator (Airflow, Argo Workflows, Prefect,
@@ -41,9 +42,32 @@ you already have a name for.
 | [`mini/executors.py`](mini/executors.py) | *Where* that runner is placed | `executors/` |
 | [`mini/scheduler.py`](mini/scheduler.py) | The loop tying the four together | `SchedulerJob` |
 
-Plus two things built on top: [`mini/dagbag.py`](mini/dagbag.py) (discovering
-DAGs by importing them) and [`mini/gitops.py`](mini/gitops.py) (git as the
-source of truth — the Argo CD idea).
+Plus three things built on top: [`mini/dagbag.py`](mini/dagbag.py) (discovering
+DAGs by importing them), [`mini/gitops.py`](mini/gitops.py) (git as the source
+of truth — the Argo CD idea), and [`mini/tracking.py`](mini/tracking.py) (MLflow
+for experiments and the model registry).
+
+## Two systems, two jobs
+
+The orchestrator and MLflow answer different questions, and conflating them is
+the classic mistake:
+
+| | Question it answers | Store |
+|---|---|---|
+| **The orchestrator** | Did this task succeed, and should the next one start? | `mini.db` |
+| **MLflow** | What did we try, what did it score, which version is live? | `mlflow.db` |
+
+Our SQLite store has no opinion about accuracy; MLflow has no opinion about
+retries. Every task opens an MLflow run tagged with the orchestrator's
+`run_id`, so the two views join on one key.
+
+```bash
+mini ui        # the MLflow dashboard, pointed at this project's store
+```
+
+Filter the UI by `mini.run_id` and you get exactly the tasks of one pipeline
+execution — params, metrics, the split that produced them, and the registered
+model version.
 
 ## The one design decision that matters
 
@@ -78,10 +102,15 @@ python -m mini run iris            # trigger and wait
 python -m mini runs                # history
 python -m mini logs <run_id> prep  # a task's stdout/stderr
 python -m mini scheduler           # the scheduling loop
+python -m mini ui                  # MLflow dashboard: runs, metrics, registry
+python -m mini predict "5.1,3.5,1.4,0.2"   # score with the registered model
+python -m mini reap                # close out runs whose scheduler died
 ```
 
-State lives in `~/.mini-mlops` (override with `MINI_HOME`): a SQLite database
-and one directory per run holding that run's artifacts and logs.
+State lives in `~/.mini-mlops` (override with `MINI_HOME`): the orchestrator's
+`mini.db`, one directory per run holding artifacts and logs, plus MLflow's
+`mlflow.db` and `mlartifacts/`. MLflow is pointed at SQLite rather than a file
+store because **the Model Registry cannot exist on a `file://` backend**.
 
 ## What each idea buys you
 
@@ -154,7 +183,7 @@ to match. Kubernetes just spells that seam `volumeMounts`.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q     # 41 tests
+python -m pytest tests/ -q     # 52 tests
 ```
 
 The run tests spawn real subprocesses through the real executor. That is slow
@@ -163,6 +192,10 @@ system capable of surprising us.
 
 ## What is deliberately missing
 
-Cron parsing (intervals only — `30s`, `5m`, `@daily`), a web UI, backfills,
-SLAs, pools, sensors, and a Kubernetes executor. Each is real work in a real
-orchestrator and none of them change the five ideas above.
+Cron parsing (intervals only — `30s`, `5m`, `@daily`), backfills, SLAs, pools,
+sensors, and a Kubernetes executor. Each is real work in a real orchestrator
+and none of them change the five ideas above.
+
+Still to come: a REST API for triggering runs and serving predictions, and a
+dashboard for pipeline state (MLflow covers experiments and models, not DAG
+runs). `DockerExecutor` is written but has never been run against a built image.
