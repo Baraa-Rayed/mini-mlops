@@ -69,6 +69,39 @@ Filter the UI by `mini.run_id` and you get exactly the tasks of one pipeline
 execution — params, metrics, the split that produced them, and the registered
 model version.
 
+## The API
+
+```bash
+python -m mini api --host 0.0.0.0     # → http://<host>:8000/docs
+```
+
+Everything is browsable and clickable at `/docs`, which matters more than it
+sounds: a system you can only exercise by remembering curl invocations is one
+nobody exercises.
+
+| Route | Does |
+|---|---|
+| `GET /dags` · `GET /dags/{id}` | what pipelines exist, and their graph |
+| `POST /dags/{id}/runs` | trigger a run (returns immediately; `wait` to block) |
+| `GET /runs` · `GET /runs/{id}` | history, and per-task state for one run |
+| `GET /runs/{id}/tasks/{task}/logs` | a task's stdout and stderr |
+| `GET /model` · `POST /model/reload` | what is registered; drop the cache |
+| `POST /predict` | score rows — **with labels**, not bare indices |
+
+```console
+$ curl -X POST http://localhost:8000/predict -H 'Content-Type: application/json' \
+       -d '{"rows": [[5.1,3.5,1.4,0.2], [6.7,3.0,5.2,2.3]]}'
+
+{"model_name": "iris-classifier", "version": "1", "predictions": [
+  {"row": [5.1,3.5,1.4,0.2], "prediction": 0, "label": "setosa",    "confidence": 0.977},
+  {"row": [6.7,3.0,5.2,2.3], "prediction": 2, "label": "virginica", "confidence": 0.907}]}
+```
+
+MLflow's own `mlflow models serve` (wrapped as `mini serve`) answers
+`/invocations` and nothing else — it cannot trigger a pipeline, report whether
+one succeeded, decode a class index, or be traced, since it is MLflow's app
+rather than ours. Both are available; this one wraps the whole system.
+
 ## The one design decision that matters
 
 `runner.py` executes a single task, and its interface is a **command line**:
@@ -102,7 +135,9 @@ python -m mini run iris            # trigger and wait
 python -m mini runs                # history
 python -m mini logs <run_id> prep  # a task's stdout/stderr
 python -m mini scheduler           # the scheduling loop
+python -m mini api                 # the project API + Swagger docs at /docs
 python -m mini ui                  # MLflow dashboard: runs, metrics, registry
+python -m mini serve               # MLflow scoring server for the model alone
 python -m mini predict "5.1,3.5,1.4,0.2"   # score with the registered model
 python -m mini reap                # close out runs whose scheduler died
 ```
@@ -183,7 +218,7 @@ to match. Kubernetes just spells that seam `volumeMounts`.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q     # 52 tests
+python -m pytest tests/ -q     # 77 tests
 ```
 
 The run tests spawn real subprocesses through the real executor. That is slow
@@ -196,6 +231,7 @@ Cron parsing (intervals only — `30s`, `5m`, `@daily`), backfills, SLAs, pools,
 sensors, and a Kubernetes executor. Each is real work in a real orchestrator
 and none of them change the five ideas above.
 
-Still to come: a REST API for triggering runs and serving predictions, and a
-dashboard for pipeline state (MLflow covers experiments and models, not DAG
-runs). `DockerExecutor` is written but has never been run against a built image.
+Still to come: a dashboard for *pipeline* state — MLflow covers experiments and
+models, not DAG runs, so run state is only visible via the CLI or the API.
+`DockerExecutor` is written but has never been run against a built image, and
+`K8sExecutor` is unwritten.

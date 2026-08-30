@@ -97,6 +97,15 @@ class DagBag:
             return importlib.reload(cached)
         return importlib.import_module(module_name)
 
+    def _is_foreign(self, module) -> bool:
+        """True when a cached module resolves outside the root we are loading."""
+        origin = getattr(module, "__file__", None) or ""
+        paths = list(getattr(module, "__path__", []))  # packages
+        locations = [Path(p).resolve() for p in ([origin] if origin else []) + paths]
+        return bool(locations) and not any(
+            loc == self.import_root or self.import_root in loc.parents for loc in locations
+        )
+
     def _evict_foreign(self, module_name: str) -> None:
         """Drop cached modules that resolve to a *different* checkout.
 
@@ -105,20 +114,21 @@ class DagBag:
         `__file__`, and a cached parent package makes Python skip `sys.path`
         for its children entirely. Stale imports are the classic way a GitOps
         deploy reports success while running the previous commit.
+
+        Evicting a package must take everything under it. `reload()` of a
+        submodule requires its parent in `sys.modules`, so dropping only the
+        parent leaves children that can never be loaded again — every later
+        scan fails with "parent 'pipelines' not in sys.modules", and the
+        DagBag reports no DAGs at all rather than stale ones.
         """
         parts = module_name.split(".")
         for depth in range(1, len(parts) + 1):
             name = ".".join(parts[:depth])
             module = sys.modules.get(name)
-            if module is None:
-                continue
-            origin = getattr(module, "__file__", None) or ""
-            paths = list(getattr(module, "__path__", []))  # packages
-            locations = [Path(p).resolve() for p in ([origin] if origin else []) + paths]
-            if locations and not any(
-                loc == self.import_root or self.import_root in loc.parents for loc in locations
-            ):
-                del sys.modules[name]
+            if module is not None and self._is_foreign(module):
+                for cached in [n for n in list(sys.modules)
+                               if n == name or n.startswith(f"{name}.")]:
+                    del sys.modules[cached]
 
     def get(self, dag_id: str) -> DAG:
         try:

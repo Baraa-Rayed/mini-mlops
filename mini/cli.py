@@ -326,6 +326,28 @@ def cmd_ui(args) -> int:
         return 0
 
 
+def cmd_api(args) -> int:
+    """Serve the project's own HTTP API, with Swagger docs at /docs."""
+    try:
+        import uvicorn
+    except ImportError:
+        print("uvicorn is not installed: pip install -r requirements.txt", file=sys.stderr)
+        return 1
+
+    from .api import create_app
+
+    app = create_app(home=args.home, dags_dir=args.dags, parallelism=args.parallelism)
+    print(f"api       http://{args.host}:{args.port}")
+    print(f"docs      http://{args.host}:{args.port}/docs")
+    print(f"state     {args.home}")
+    print("          ctrl-c to stop\n")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def cmd_serve(args) -> int:
     """Serve the registered model over HTTP, so it can be called by anything.
 
@@ -376,84 +398,52 @@ def cmd_serve(args) -> int:
 def cmd_predict(args) -> int:
     """Score a row with the model MLflow currently has registered.
 
-    The counterpart to `register`: training is only half a pipeline, and a
-    model nobody can call is indistinguishable from one that was never built.
-    It resolves `models:/<name>/<version>` from the registry rather than a
-    path you supply, so what answers here is by construction what the quality
-    gate approved and promoted.
+    Thin by design: the loading, decoding and tracing all live in
+    `mini.inference`, shared with the API, so the terminal and the HTTP
+    endpoint cannot answer differently.
     """
-    from .tracking import DEFAULT_MODEL_NAME, latest_version, tracking_uri
+    from .inference import NoModelRegistered, load, predict
 
-    name = args.model or DEFAULT_MODEL_NAME
     try:
-        version = latest_version(name)
-    except Exception as exc:  # noqa: BLE001 — a missing store is a normal first-run state
-        print(f"cannot reach the MLflow registry at {tracking_uri()}: {exc}", file=sys.stderr)
+        registered = load(args.model, args.version)
+    except NoModelRegistered as exc:
+        print(exc, file=sys.stderr)
         return 1
-    if version is None:
-        print(f"no registered model {name!r} — run `mini run iris` first", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — an unreachable store is a normal first-run state
+        print(f"cannot reach the MLflow registry: {exc}", file=sys.stderr)
         return 1
-
-    import mlflow
-    import pandas as pd
-
-    mlflow.set_tracking_uri(tracking_uri())
-    tags = version.tags or {}
-    # Schema travels with the model: the signature carries column names, and
-    # the class labels ride along as a tag so a bare index never reaches a user.
-    model = mlflow.sklearn.load_model(f"models:/{name}/{version.version}")
-    signature_inputs = getattr(getattr(model, "feature_names_in_", None), "tolist", lambda: None)()
-    features = signature_inputs or json.loads(tags.get("features", "[]"))
-    classes = json.loads(tags.get("classes", "[]"))
 
     if args.show:
-        print(f"model     {name} v{version.version}  ({tags.get('kind', 'unknown')})")
-        print(f"accuracy  {tags.get('accuracy', '?')}")
-        print(f"source    run {tags.get('mini.run_id', '?')}")
-        print(f"features  {', '.join(features)}")
-        print(f"classes   {', '.join(classes)}")
-        print(f"uri       models:/{name}/{version.version}")
+        print(f"model     {registered.name} v{registered.version}  ({registered.kind})")
+        print(f"accuracy  {registered.accuracy or '?'}")
+        print(f"source    run {registered.source_run or '?'}")
+        print(f"features  {', '.join(registered.features)}")
+        print(f"classes   {', '.join(registered.classes)}")
+        print(f"uri       {registered.uri}")
         return 0
 
     rows = []
     for raw in args.values:
         parts = [p for p in raw.replace(",", " ").split() if p]
-        if len(parts) != len(features):
-            print(f"expected {len(features)} values ({', '.join(features)}), got {len(parts)}: {raw!r}",
-                  file=sys.stderr)
-            return 1
-        rows.append([float(p) for p in parts])
-    # A DataFrame with the training column names, not a bare array: sklearn
-    # matches features by position but warns when the names go missing, and
-    # a silent column-order mismatch is a wrong answer rather than an error.
-    frame = pd.DataFrame(rows, columns=features)
-    predictions = model.predict(frame)
-
-    probabilities = model.predict_proba(frame) if hasattr(model, "predict_proba") else None
-
-    if not args.no_trace:
-        # Record the call so it shows up in the dashboard's Traces tab. Without
-        # this, inference is invisible: the tracking store knows how the model
-        # was built and nothing about how it is used.
-        from .tracking import prediction_trace
-
-        experiment = tags.get("mini.dag_id") or "inference"
         try:
-            with prediction_trace(experiment, f"models:/{name}/{version.version}") as span:
-                span.set_inputs({"rows": rows, "features": features})
-                span.set_outputs({
-                    "predictions": [int(p) for p in predictions],
-                    "labels": [classes[int(p)] for p in predictions],
-                })
-        except Exception as exc:  # noqa: BLE001 — never fail a prediction over telemetry
-            print(f"(trace not recorded: {exc})", file=sys.stderr)
+            rows.append([float(p) for p in parts])
+        except ValueError:
+            print(f"not a number in {raw!r}", file=sys.stderr)
+            return 1
+    if not rows:
+        print("nothing to predict — pass one row per argument, e.g. \"5.1,3.5,1.4,0.2\"", file=sys.stderr)
+        return 1
 
-    for i, (row, prediction) in enumerate(zip(rows, predictions)):
-        label = classes[int(prediction)]
-        line = f"{row} -> {label}"
-        if probabilities is not None:
-            best = probabilities[i][int(prediction)]
-            line += f"  (confidence {best:.3f})"
+    try:
+        results = predict(registered, rows, trace=not args.no_trace)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    for result in results:
+        line = f"{result.row} -> {result.label or result.prediction}"
+        if result.confidence is not None:
+            line += f"  (confidence {result.confidence:.3f})"
         print(line)
     return 0
 
@@ -565,6 +555,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "domain (repeatable); MLflow 403s anything it does not recognise")
     p.set_defaults(func=cmd_ui)
 
+    p = sub.add_parser("api", help="serve the project API (Swagger docs at /docs)")
+    p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to expose on the network")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--log-level", default="info", choices=["critical", "error", "warning", "info", "debug"])
+    p.set_defaults(func=cmd_api)
+
     p = sub.add_parser("serve", help="serve the registered model over HTTP")
     p.add_argument("--model", default=None, help="registered model name")
     p.add_argument("--version", default=None, help="version to serve (default: newest)")
@@ -577,6 +573,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("predict", help="score a row with the registered model")
     p.add_argument("values", nargs="*", help='one row per argument, e.g. "5.1,3.5,1.4,0.2"')
     p.add_argument("--model", default=None, help="registered model name")
+    p.add_argument("--version", default=None, help="version to use (default: newest)")
     p.add_argument("--show", action="store_true", help="describe the registered model and exit")
     p.add_argument("--no-trace", action="store_true",
                    help="do not record this call in the MLflow Traces tab")

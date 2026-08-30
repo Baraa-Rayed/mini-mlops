@@ -220,3 +220,22 @@ def test_supplied_executor_is_retargeted_at_the_checkout(tmp_path, origin):
     result = app.sync()
     assert result["action"] == "synced"
     assert store.results(result["runs"][0])["emit"]["marker"] == "v1"
+
+
+def test_switching_back_to_the_local_pipelines_still_works(tmp_path, origin):
+    """Regression: evicting a stale parent package left its children cached.
+
+    `reload()` of a submodule needs its parent in sys.modules, so dropping only
+    `pipelines` made `pipelines.iris` permanently unloadable — every later scan
+    failed with "parent 'pipelines' not in sys.modules" and the DagBag reported
+    *no* DAGs rather than stale ones. Alternating between a checkout and the
+    local folder is exactly what a sync followed by a local run does.
+    """
+    from mini.dagbag import DagBag
+
+    assert {"iris", "flaky"} <= set(DagBag().dags)          # local
+    GitOps(Store(tmp_path / "h"), repo=str(origin), app="flip",
+           workdir=tmp_path / "co").sync()                   # checkout
+    local = DagBag()                                         # local again
+    assert not local.errors, local.errors
+    assert {"iris", "flaky"} <= set(local.dags)
